@@ -2,7 +2,7 @@
 
 > Converts office files to PDF files 
 
-This library is a wrapper around [unoserver](https://github.com/unoconv/unoserver) which uses [LibreOffice](https://www.libreoffice.org/) to
+This library is a Rust wrapper around [unoserver](https://github.com/unoconv/unoserver) which uses [LibreOffice](https://www.libreoffice.org/) to
 convert the office files to PDF.
 
 ## Installation
