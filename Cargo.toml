@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Error handling
+thiserror = "1"
+
+# System info to check running processes
+sysinfo = "0.30.13"
+
+# Asyncronous runtime
+tokio = { version = "1.39.2", features = ["full"] }
