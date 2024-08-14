@@ -18,7 +18,7 @@ thiserror = "1"
 sysinfo = "0.30"
 
 # Asyncronous runtime
-tokio = { version = "1", features = ["io-util", "process", "time"] }
-
-[dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+# Request for busy checking
+reqwest = "0.12"

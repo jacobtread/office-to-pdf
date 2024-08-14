@@ -18,3 +18,15 @@ services:
       dockerfile: ./unoserver.Dockerfile
     ports: 
       - 9252:2003
+  node4:
+    build:
+      context: .
+      dockerfile: ./unoserver.Dockerfile
+    ports: 
+      - 9253:2003
+  node5:
+    build:
+      context: .
+      dockerfile: ./unoserver.Dockerfile
+    ports: 
+      - 9254:2003

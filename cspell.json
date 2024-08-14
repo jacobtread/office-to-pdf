@@ -17,6 +17,7 @@
         "officedocument",
         "opendocument",
         "openxmlformats",
+        "reqwest",
         "sffnumbers",
         "sffpages",
         "spreadsheetml",
