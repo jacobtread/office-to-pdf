@@ -1,0 +1,20 @@
+# Docker setup for multiple unoserver instances
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: ./unoserver.Dockerfile
+    ports: 
+      - 9250:2003
+  node2:
+    build:
+      context: .
+      dockerfile: ./unoserver.Dockerfile
+    ports: 
+      - 9251:2003
+  node3:
+    build:
+      context: .
+      dockerfile: ./unoserver.Dockerfile
+    ports: 
+      - 9252:2003

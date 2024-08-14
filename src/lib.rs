@@ -60,17 +60,57 @@ pub enum OfficeError {
     ConverterError(String),
 }
 
+/// Options for the converter
+#[derive(Debug, Default)]
+pub struct ConvertOptions {
+    /// Host server to perform the conversion
+    host: ConvertServerHost,
+}
+
+#[derive(Debug, Default)]
+pub enum ConvertServerHost {
+    /// Local converter server
+    #[default]
+    Local,
+
+    /// Remove converter server
+    Remote { host: String, port: u16 },
+}
+
 /// Converts the provided input bytes from an office file format
 /// into a pdf file
-pub async fn office_to_pdf(input_bytes: &[u8]) -> Result<Vec<u8>, OfficeError> {
+pub async fn office_to_pdf(
+    input_bytes: &[u8],
+    options: &ConvertOptions,
+) -> Result<Vec<u8>, OfficeError> {
     // Ensure server is running
     if !is_unoserver_running() {
         start_unoserver().await?;
     }
 
+    let mut args = Vec::<String>::new();
+
+    match &options.host {
+        ConvertServerHost::Local => {
+            args.push("--host-location".to_string());
+            args.push("local".to_string());
+        }
+        ConvertServerHost::Remote { host, port } => {
+            args.push("--host-location".to_string());
+            args.push("remote".to_string());
+
+            args.push("--host".to_string());
+            args.push(host.to_string());
+
+            args.push("--port".to_string());
+            args.push(port.to_string());
+        }
+    }
+
     // Spawn the unoconvert process
     let mut child = Command::new("unoconvert")
         .args(["--convert-to", "pdf", "-", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,7 +290,7 @@ const CONVERTABLE_FORMATS: &[&str] = &[
 #[cfg(test)]
 mod test {
 
-    use crate::{office_to_pdf, start_unoserver, OfficeError};
+    use crate::{office_to_pdf, start_unoserver, ConvertOptions, OfficeError};
 
     /// Tests the unoserver can be started
     #[tokio::test]
@@ -266,7 +306,9 @@ mod test {
         start_unoserver().await.unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-docx.docx").await.unwrap();
-        let _output = office_to_pdf(&input_bytes).await.unwrap();
+        let _output = office_to_pdf(&input_bytes, &ConvertOptions::default())
+            .await
+            .unwrap();
     }
 
     /// Tests a sample docx with an image
@@ -278,7 +320,9 @@ mod test {
         let input_bytes = tokio::fs::read("./samples/sample-docx-with-image.docx")
             .await
             .unwrap();
-        let _output = office_to_pdf(&input_bytes).await.unwrap();
+        let _output = office_to_pdf(&input_bytes, &ConvertOptions::default())
+            .await
+            .unwrap();
     }
 
     /// Tests an encrypted docx
@@ -290,7 +334,9 @@ mod test {
         let input_bytes = tokio::fs::read("./samples/sample-docx-encrypted.docx")
             .await
             .unwrap();
-        let err = office_to_pdf(&input_bytes).await.unwrap_err();
+        let err = office_to_pdf(&input_bytes, &ConvertOptions::default())
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, OfficeError::EncryptedDocument))
     }
@@ -302,7 +348,9 @@ mod test {
         start_unoserver().await.unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-xlsx.xlsx").await.unwrap();
-        let _output = office_to_pdf(&input_bytes).await.unwrap();
+        let _output = office_to_pdf(&input_bytes, &ConvertOptions::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -313,8 +361,28 @@ mod test {
         let input_bytes = tokio::fs::read("./samples/sample-xlsx-encrypted.xlsx")
             .await
             .unwrap();
-        let err = office_to_pdf(&input_bytes).await.unwrap_err();
+        let err = office_to_pdf(&input_bytes, &ConvertOptions::default())
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, OfficeError::EncryptedDocument))
+    }
+
+    /// Tests a sample docx
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once, requires running remote instance"]
+    async fn test_sample_docx_remote() {
+        let input_bytes = tokio::fs::read("./samples/sample-docx.docx").await.unwrap();
+        let _output = office_to_pdf(
+            &input_bytes,
+            &ConvertOptions {
+                host: crate::ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9250,
+                },
+            },
+        )
+        .await
+        .unwrap();
     }
 }
