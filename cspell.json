@@ -1,8 +1,29 @@
 {
     "ignoreWords": [],
     "words": [
+        "abiword",
+        "aportisdoc",
+        "clarisworks",
+        "convertable",
+        "docbook",
+        "epub",
+        "fictionbook",
+        "gnumeric",
+        "iwork",
+        "macwriteii",
+        "mathml",
+        "msword",
+        "mswrite",
+        "officedocument",
+        "opendocument",
+        "openxmlformats",
+        "sffnumbers",
+        "sffpages",
+        "spreadsheetml",
         "sysinfo",
         "unoconvert",
-        "unoserver"
+        "unoserver",
+        "wordpro",
+        "wordprocessingml"
     ]
 }
