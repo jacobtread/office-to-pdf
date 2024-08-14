@@ -142,6 +142,7 @@ pub async fn start_unoserver() -> Result<AbortHandle, OfficeError> {
         // Pipe output for reading
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(OfficeError::StartConverterServer)?;
 
@@ -248,11 +249,72 @@ const CONVERTABLE_FORMATS: &[&str] = &[
 
 #[cfg(test)]
 mod test {
-    use crate::start_unoserver;
+
+    use crate::{office_to_pdf, start_unoserver, OfficeError};
 
     /// Tests the unoserver can be started
     #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_unoserver() {
-        _ = start_unoserver().await.unwrap();
+        start_unoserver().await.unwrap();
+    }
+
+    /// Tests a sample docx
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
+    async fn test_sample_docx() {
+        start_unoserver().await.unwrap();
+
+        let input_bytes = tokio::fs::read("./samples/sample-docx.docx").await.unwrap();
+        let _output = office_to_pdf(&input_bytes).await.unwrap();
+    }
+
+    /// Tests a sample docx with an image
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
+    async fn test_sample_docx_with_image() {
+        start_unoserver().await.unwrap();
+
+        let input_bytes = tokio::fs::read("./samples/sample-docx-with-image.docx")
+            .await
+            .unwrap();
+        let _output = office_to_pdf(&input_bytes).await.unwrap();
+    }
+
+    /// Tests an encrypted docx
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
+    async fn test_sample_docx_encrypted() {
+        start_unoserver().await.unwrap();
+
+        let input_bytes = tokio::fs::read("./samples/sample-docx-encrypted.docx")
+            .await
+            .unwrap();
+        let err = office_to_pdf(&input_bytes).await.unwrap_err();
+
+        assert!(matches!(err, OfficeError::EncryptedDocument))
+    }
+
+    /// Tests a sample xlsx
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
+    async fn test_sample_xlsx() {
+        start_unoserver().await.unwrap();
+
+        let input_bytes = tokio::fs::read("./samples/sample-xlsx.xlsx").await.unwrap();
+        let _output = office_to_pdf(&input_bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "slow and resource intensive if these tests are run all at once"]
+    async fn test_sample_xlsx_encrypted() {
+        start_unoserver().await.unwrap();
+
+        let input_bytes = tokio::fs::read("./samples/sample-xlsx-encrypted.xlsx")
+            .await
+            .unwrap();
+        let err = office_to_pdf(&input_bytes).await.unwrap_err();
+
+        assert!(matches!(err, OfficeError::EncryptedDocument))
     }
 }
