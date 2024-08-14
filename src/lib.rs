@@ -17,7 +17,12 @@
 use std::{process::Stdio, time::Duration};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, process::Command, time::sleep};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    task::AbortHandle,
+    time::timeout,
+};
 
 /// Errors that can occur while converting an office file
 #[derive(Debug, Error)]
@@ -128,14 +133,57 @@ pub fn is_unoserver_running() -> bool {
 ///
 /// Must be running in the background otherwise the unoconvert program
 /// will hang waiting from a server to start
-pub async fn start_unoserver() -> Result<(), OfficeError> {
-    Command::new("unoserver")
+pub async fn start_unoserver() -> Result<AbortHandle, OfficeError> {
+    // Timeout if the server didn't start within 5 minutes
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+
+    // Spawn the unoserver process
+    let mut child = Command::new("unoserver")
+        // Pipe output for reading
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(OfficeError::StartConverterServer)?;
 
-    // Wait for unoserver to initialize
-    sleep(Duration::from_secs(5)).await;
-    Ok(())
+    timeout(STARTUP_TIMEOUT, async move {
+        let stderr = child.stderr.as_mut().expect("child missing stdout");
+        let mut stderr_reader = BufReader::new(stderr).lines();
+
+        loop {
+            // Read from the input
+            let value = match stderr_reader.next_line().await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Err(OfficeError::StartConverterServer(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "didn't receive start message from unoserver",
+                    )))
+                }
+                Err(err) => return Err(OfficeError::StartConverterServer(err)),
+            };
+
+            // Wait until startup message is received
+            if value.contains("Server PID:") {
+                break;
+            }
+        }
+
+        // Move server to background task
+        let abort_handle = tokio::spawn(async move {
+            _ = child.wait().await;
+        })
+        .abort_handle();
+
+        Ok(abort_handle)
+    })
+    .await
+    .map_err(|_| {
+        OfficeError::StartConverterServer(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "unoserver startup timeout exceeded",
+        ))
+    })
+    .and_then(std::convert::identity)
 }
 
 /// Checks if the provided mime is included in the known convertable mime types
@@ -197,3 +245,14 @@ const CONVERTABLE_FORMATS: &[&str] = &[
     "application/docbook+xml",
     "application/xhtml+xml",
 ];
+
+#[cfg(test)]
+mod test {
+    use crate::start_unoserver;
+
+    /// Tests the unoserver can be started
+    #[tokio::test]
+    async fn test_unoserver() {
+        _ = start_unoserver().await.unwrap();
+    }
+}
