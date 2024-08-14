@@ -42,6 +42,14 @@ pub enum OfficeError {
     #[error("error while waiting for converter output: {0}")]
     ConverterOutput(std::io::Error),
 
+    /// Document was malformed
+    #[error("office document is malformed")]
+    MalformedDocument,
+
+    /// Document was encrypted
+    #[error("office document is password protected")]
+    EncryptedDocument,
+
     /// Converter program returned an error
     #[error("converter returned error: {0}")]
     ConverterError(String),
@@ -90,6 +98,16 @@ pub async fn office_to_pdf(input_bytes: &[u8]) -> Result<Vec<u8>, OfficeError> {
         } else {
             "Unknown error".to_string()
         };
+
+        // Handle malformed document
+        if error.contains("Could not load document") {
+            return Err(OfficeError::MalformedDocument);
+        }
+
+        // Handle encrypted document
+        if error.contains("Unsupported URL <private:stream>") {
+            return Err(OfficeError::EncryptedDocument);
+        }
 
         return Err(OfficeError::ConverterError(error));
     }
