@@ -1,18 +1,5 @@
-//! Office to PDF conversion
-//!
-//! ```no_run
-//! use office_to_pdf::office_to_pdf;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let bytes: &[u8] = &[/* ...office file bytes from docx or similar */];
-//!     let pdf: Vec<u8> = ConvertServer::default().convert_to_pdf(bytes).await.expect("failed to convert to pdf");
-//! }
-//!
-//! ```
-//!
-//! Requires libreoffice and unoserver, only supported for linux. See README for installation
-//! details
+#![warn(missing_docs)]
+#![doc = include_str!("../README.md")]
 
 use std::{
     net::SocketAddr,
@@ -35,26 +22,14 @@ use tokio::{
 
 /// Errors that can occur while converting an office file
 #[derive(Debug, Error)]
-pub enum OfficeError {
-    /// Error starting the converter server
-    #[error("failed to start unoserver: {0}")]
-    StartConverterServer(std::io::Error),
-
+pub enum ConvertError {
     /// Error starting the converter program
     #[error("failed to start unoconvert: {0}")]
     StartConverter(std::io::Error),
 
-    /// Converter stdin was not available to write to
-    #[error("unable to access converter input")]
-    MissingConverterInput,
-
-    /// Error while writing the document as input to the converter
-    #[error("failed to write input into converter")]
-    ConverterInput(std::io::Error),
-
-    /// Error while the program output was being waited for / read
-    #[error("error while waiting for converter output: {0}")]
-    ConverterOutput(std::io::Error),
+    /// Error when working with the child program stdin/stdout
+    #[error("error working with child process io: {0}")]
+    ProcessIo(std::io::Error),
 
     /// Document was malformed
     #[error("office document is malformed")]
@@ -69,18 +44,47 @@ pub enum OfficeError {
     ConverterError(String),
 }
 
+/// Error when starting an unoserver
+#[derive(Debug, Error)]
+pub enum ServerError {
+    /// Timeout for starting the server was exceeded
+    #[error("office server startup timeout reached")]
+    StartTimeoutReached,
+
+    /// Didn't get a startup message but the program exited
+    #[error("office server process ended without a startup message")]
+    NoStartupMessage,
+
+    /// Error when working with the server program stdin/stdout
+    #[error("error working with server process io: {0}")]
+    ProcessIo(std::io::Error),
+}
+
 /// Default port for unoserver
 pub const DEFAULT_SERVER_PORT: u16 = 2003;
 /// Default port for the Libreoffice uno
 pub const DEFAULT_UNO_PORT: u16 = 2002;
 
+/// Server connection details
 #[derive(Debug)]
 pub enum ConvertServerHost {
     /// Local converter server
-    Local { port: u16 },
+    ///
+    /// For server running locally on the same machine
+    Local {
+        /// The local server port
+        port: u16,
+    },
 
     /// Remove converter server
-    Remote { host: String, port: u16 },
+    ///
+    /// For server running on remote machine
+    Remote {
+        /// The remote server host
+        host: String,
+        /// The remote server port
+        port: u16,
+    },
 }
 
 impl Default for ConvertServerHost {
@@ -98,6 +102,7 @@ pub struct ConvertServer {
     host: ConvertServerHost,
 }
 
+/// State for a converter server
 pub enum ConvertServerState {
     /// Server cannot be reached
     Unreachable,
@@ -110,8 +115,10 @@ pub enum ConvertServerState {
 }
 
 impl ConvertServer {
+    /// Default timeout for the running check
     pub const DEFAULT_RUNNING_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// Creates a new server
     pub fn new(host: ConvertServerHost) -> Self {
         Self { host }
     }
@@ -199,7 +206,7 @@ impl ConvertServer {
     }
 
     /// Converts the provided office file bytes to PDF file bytes
-    pub async fn convert_to_pdf(&self, input_bytes: &[u8]) -> Result<Vec<u8>, OfficeError> {
+    pub async fn convert_to_pdf(&self, input_bytes: &[u8]) -> Result<Vec<u8>, ConvertError> {
         let mut args = Vec::<String>::new();
 
         match &self.host {
@@ -230,26 +237,26 @@ impl ConvertServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(OfficeError::StartConverter)?;
+            .map_err(ConvertError::StartConverter)?;
 
         // Write the input data to the child process's stdin
         {
             let stdin = child
                 .stdin
                 .as_mut()
-                .ok_or(OfficeError::MissingConverterInput)?;
+                .expect("stdin was piped but missing from child process");
 
             stdin
                 .write_all(input_bytes)
                 .await
-                .map_err(OfficeError::ConverterInput)?;
+                .map_err(ConvertError::ProcessIo)?;
         }
 
         // Wait for the program to run
         let output = child
             .wait_with_output()
             .await
-            .map_err(OfficeError::ConverterOutput)?;
+            .map_err(ConvertError::ProcessIo)?;
 
         if !output.status.success() {
             // Determine error message
@@ -261,15 +268,15 @@ impl ConvertServer {
 
             // Handle malformed document
             if error.contains("Could not load document") {
-                return Err(OfficeError::MalformedDocument);
+                return Err(ConvertError::MalformedDocument);
             }
 
             // Handle encrypted document
             if error.contains("Unsupported URL <private:stream>") {
-                return Err(OfficeError::EncryptedDocument);
+                return Err(ConvertError::EncryptedDocument);
             }
 
-            return Err(OfficeError::ConverterError(error));
+            return Err(ConvertError::ConverterError(error));
         }
 
         Ok(output.stdout)
@@ -335,7 +342,7 @@ impl ConvertLoadBalancer {
     }
 
     /// Handles a conversion using one of the load balancers
-    pub async fn handle(&self, input_bytes: &[u8]) -> Result<Vec<u8>, OfficeError> {
+    pub async fn handle(&self, input_bytes: &[u8]) -> Result<Vec<u8>, ConvertError> {
         let inner = &*self.inner;
 
         loop {
@@ -384,7 +391,7 @@ impl ConvertLoadBalancer {
 ///
 /// Must be running in the background otherwise the unoconvert program
 /// will hang waiting from a server to start
-pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHandle, OfficeError> {
+pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHandle, ServerError> {
     // Timeout if the server didn't start within 5 minutes
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
@@ -401,7 +408,7 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHan
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(OfficeError::StartConverterServer)?;
+        .map_err(ServerError::ProcessIo)?;
 
     timeout(STARTUP_TIMEOUT, async move {
         let stderr = child.stderr.as_mut().expect("child missing stdout");
@@ -409,16 +416,11 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHan
 
         loop {
             // Read from the input
-            let value = match stderr_reader.next_line().await {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return Err(OfficeError::StartConverterServer(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "didn't receive start message from unoserver",
-                    )))
-                }
-                Err(err) => return Err(OfficeError::StartConverterServer(err)),
-            };
+            let value = stderr_reader
+                .next_line()
+                .await
+                .map_err(ServerError::ProcessIo)?
+                .ok_or(ServerError::NoStartupMessage)?;
 
             // Wait until startup message is received
             if value.contains("Server PID:") {
@@ -435,12 +437,7 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHan
         Ok(abort_handle)
     })
     .await
-    .map_err(|_| {
-        OfficeError::StartConverterServer(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "unoserver startup timeout exceeded",
-        ))
-    })
+    .map_err(|_| ServerError::StartTimeoutReached)
     .and_then(std::convert::identity)
 }
 
@@ -450,7 +447,7 @@ pub fn is_known_convertable(mime: &str) -> bool {
 }
 
 /// List of supported convertable formats
-const CONVERTABLE_FORMATS: &[&str] = &[
+pub const CONVERTABLE_FORMATS: &[&str] = &[
     "text/html",
     "application/msword",
     "application/vnd.oasis.opendocument.text-flat-xml",
@@ -507,14 +504,12 @@ const CONVERTABLE_FORMATS: &[&str] = &[
 #[cfg(test)]
 mod test {
 
-    use std::{sync::Arc, time::Duration};
-
-    use tokio::task::JoinSet;
-
     use crate::{
-        start_unoserver, ConvertLoadBalancer, ConvertServer, ConvertServerHost, ConvertServerState,
-        OfficeError, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
+        start_unoserver, ConvertError, ConvertLoadBalancer, ConvertServer, ConvertServerHost,
+        ConvertServerState, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
     };
+    use std::{sync::Arc, time::Duration};
+    use tokio::task::JoinSet;
 
     /// Tests the unoserver can be started
     #[tokio::test]
@@ -596,7 +591,7 @@ mod test {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, OfficeError::EncryptedDocument))
+        assert!(matches!(err, ConvertError::EncryptedDocument))
     }
 
     /// Tests a sample xlsx
@@ -629,7 +624,7 @@ mod test {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, OfficeError::EncryptedDocument))
+        assert!(matches!(err, ConvertError::EncryptedDocument))
     }
 
     /// Tests a sample docx
