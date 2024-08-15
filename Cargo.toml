@@ -2,7 +2,7 @@
 name = "office-to-pdf"
 version = "0.2.0"
 readme = "README.md"
-keywords = ["EA", "PocketRelay", "MassEffect"]
+keywords = ["Office", "PDF", "Converter"]
 edition = "2021"
 license = "MIT"
 authors = ["Jacobtread <jacobtread@gmail.com>"]
