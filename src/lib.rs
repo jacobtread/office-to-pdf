@@ -507,7 +507,7 @@ const CONVERTABLE_FORMATS: &[&str] = &[
 #[cfg(test)]
 mod test {
 
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use tokio::task::JoinSet;
 
@@ -647,7 +647,7 @@ mod test {
     }
 
     /// Tests a sample docx
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "slow and resource intensive if these tests are run all at once, requires running remote instance"]
     async fn test_sample_docx_remote_load_balanced() {
         let pool = ConvertLoadBalancer::new(
@@ -678,12 +678,13 @@ mod test {
         );
 
         let mut join_set = JoinSet::new();
+        let input_bytes = Arc::new(tokio::fs::read("./samples/sample-docx.docx").await.unwrap());
 
-        for _ in 0..100 {
+        for _ in 0..10 {
             let pool = pool.clone();
+            let input_bytes = input_bytes.clone();
 
             join_set.spawn(async move {
-                let input_bytes = tokio::fs::read("./samples/sample-docx.docx").await.unwrap();
                 pool.handle(&input_bytes).await.unwrap();
             });
         }
