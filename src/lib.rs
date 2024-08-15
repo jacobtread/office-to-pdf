@@ -3,9 +3,7 @@
 
 use libc::kill;
 use std::{
-    env::temp_dir,
-    net::SocketAddr,
-    path::PathBuf,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,9 +14,10 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{lookup_host, TcpStream},
+    net::{lookup_host, TcpListener, TcpStream},
     process::{Child, Command},
     sync::Notify,
+    task::JoinSet,
     time::timeout,
 };
 
@@ -61,9 +60,17 @@ pub enum ServerError {
     #[error("libreoffice pid was missing or invalid")]
     InvalidOrMissingPid,
 
+    /// Failed to allocate a server in a pool
+    #[error("failed to allocate pool")]
+    AllocatePool,
+
     /// Error when working with the server program stdin/stdout
     #[error("error working with server process io: {0}")]
     ProcessIo(std::io::Error),
+
+    /// Error attempting to find a free port
+    #[error("failed to obtain free port: {0}")]
+    ObtainPort(std::io::Error),
 }
 
 /// Default port for unoserver
@@ -72,7 +79,7 @@ pub const DEFAULT_SERVER_PORT: u16 = 2003;
 pub const DEFAULT_UNO_PORT: u16 = 2002;
 
 /// Server connection details
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConvertServerHost {
     /// Local converter server
     ///
@@ -395,39 +402,113 @@ impl ConvertLoadBalancer {
 
 /// Unoserver instance managed locally within the process.
 ///
-/// Ensure you call [UnoServer::stop] otherwise the Libreoffice
+/// Ensure you call [LocalServer::stop] otherwise the Libreoffice
 /// process will continue to run in the background
-pub struct UnoServer {
+pub struct LocalServer {
+    /// The host for the server
+    pub host: ConvertServerHost,
     /// Child process running unoserver
     child: Child,
     /// Path to the PID file for libreoffice
     pid: libc::pid_t,
 }
 
-impl UnoServer {
+impl LocalServer {
     /// Stops the server
-    pub async fn stop(mut self) {
+    pub async fn stop(mut self) -> std::io::Result<()> {
         // Kill the child process
-        if let Err(err) = self.child.kill().await {
-            eprintln!("failed to kill sever process: {err}");
-        };
+        self.child.kill().await?;
 
         // Kill the libreoffice process
-        if let Err(err) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // Kill the process
             unsafe {
                 kill(self.pid, libc::SIGTERM);
             }
         })
         .await
-        {
-            eprintln!("failed to join unoserver kill: {err}")
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "failed to join server kill task")
+        })?;
+
+        Ok(())
+    }
+}
+
+/// Helper to find a free port on the system
+async fn get_free_port() -> std::io::Result<u16> {
+    // Bind a server and let the OS pick the port
+    let listener =
+        TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).await?;
+
+    // Get the given port
+    let local_addr = listener.local_addr()?;
+    let port = local_addr.port();
+
+    Ok(port)
+}
+
+/// Pool of locally allocated servers
+pub struct LocalServerPool {
+    /// The available servers
+    pub servers: Vec<LocalServer>,
+}
+
+impl LocalServerPool {
+    /// Spawns a pool of `count` size
+    pub async fn spawn(count: usize) -> Result<LocalServerPool, ServerError> {
+        let mut pool = LocalServerPool {
+            servers: Vec::new(),
+        };
+
+        let mut join_set: JoinSet<Result<LocalServer, ServerError>> = JoinSet::new();
+
+        for _ in 0..count {
+            let server_port = get_free_port().await.map_err(ServerError::ObtainPort)?;
+            let uno_port = get_free_port().await.map_err(ServerError::ObtainPort)?;
+
+            join_set.spawn(async move {
+                let server = start_unoserver(server_port, uno_port).await?;
+
+                Ok(server)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(value)) => pool.servers.push(value),
+                Ok(Err(err)) => {
+                    pool.stop().await;
+                    return Err(err);
+                }
+                Err(_) => {
+                    pool.stop().await;
+                    return Err(ServerError::AllocatePool);
+                }
+            }
+        }
+
+        Ok(pool)
+    }
+
+    /// Provides a list of server hosts from the available servers
+    pub fn server_hosts(&self) -> Vec<ConvertServerHost> {
+        self.servers
+            .iter()
+            .map(|value| value.host.clone())
+            .collect()
+    }
+
+    /// Stops the pool
+    pub async fn stop(self) {
+        for server in self.servers {
+            _ = server.stop().await;
         }
     }
 }
 
 /// Start a unoserver instance
-pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<UnoServer, ServerError> {
+pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<LocalServer, ServerError> {
     // Timeout if the server didn't start within 5 minutes
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
@@ -473,7 +554,11 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<UnoServe
                 .parse::<libc::pid_t>()
                 .map_err(|_| ServerError::InvalidOrMissingPid)?;
 
-            return Ok(UnoServer { child, pid });
+            return Ok(LocalServer {
+                host: ConvertServerHost::Local { port: server_port },
+                child,
+                pid,
+            });
         }
     })
     .await
@@ -546,10 +631,10 @@ mod test {
 
     use crate::{
         start_unoserver, ConvertError, ConvertLoadBalancer, ConvertServer, ConvertServerHost,
-        ConvertServerState, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
+        ConvertServerState, LocalServerPool, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
     };
     use std::{sync::Arc, time::Duration};
-    use tokio::{task::JoinSet, try_join};
+    use tokio::task::JoinSet;
 
     /// Tests the unoserver can be started
     #[tokio::test]
@@ -731,13 +816,14 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "slow and resource intensive if these tests are run all at once, requires running remote instance"]
     async fn test_sample_docx_local_load_balanced() {
-        let (a, b) = try_join!(start_unoserver(9250, 9251), start_unoserver(9252, 9253)).unwrap();
+        let server_pool = LocalServerPool::spawn(2).await.unwrap();
 
         let pool = ConvertLoadBalancer::new(
-            vec![
-                ConvertServer::new(ConvertServerHost::Local { port: 9250 }),
-                ConvertServer::new(ConvertServerHost::Local { port: 9252 }),
-            ],
+            server_pool
+                .server_hosts()
+                .into_iter()
+                .map(ConvertServer::new)
+                .collect(),
             Duration::from_millis(200),
             Duration::from_millis(500),
         );
@@ -756,7 +842,6 @@ mod test {
 
         while (join_set.join_next().await).is_some() {}
 
-        a.stop().await;
-        b.stop().await;
+        server_pool.stop().await;
     }
 }
