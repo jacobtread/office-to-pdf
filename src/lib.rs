@@ -1,8 +1,11 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+use libc::kill;
 use std::{
+    env::temp_dir,
     net::SocketAddr,
+    path::PathBuf,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,9 +17,8 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{lookup_host, TcpStream},
-    process::Command,
+    process::{Child, Command},
     sync::Notify,
-    task::AbortHandle,
     time::timeout,
 };
 
@@ -54,6 +56,10 @@ pub enum ServerError {
     /// Didn't get a startup message but the program exited
     #[error("office server process ended without a startup message")]
     NoStartupMessage,
+
+    /// Couldn't get a PID for the libreoffice server
+    #[error("libreoffice pid was missing or invalid")]
+    InvalidOrMissingPid,
 
     /// Error when working with the server program stdin/stdout
     #[error("error working with server process io: {0}")]
@@ -387,11 +393,41 @@ impl ConvertLoadBalancer {
     }
 }
 
-/// Start the conversion server
+/// Unoserver instance managed locally within the process.
 ///
-/// Must be running in the background otherwise the unoconvert program
-/// will hang waiting from a server to start
-pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHandle, ServerError> {
+/// Ensure you call [UnoServer::stop] otherwise the Libreoffice
+/// process will continue to run in the background
+pub struct UnoServer {
+    /// Child process running unoserver
+    child: Child,
+    /// Path to the PID file for libreoffice
+    pid: libc::pid_t,
+}
+
+impl UnoServer {
+    /// Stops the server
+    pub async fn stop(mut self) {
+        // Kill the child process
+        if let Err(err) = self.child.kill().await {
+            eprintln!("failed to kill sever process: {err}");
+        };
+
+        // Kill the libreoffice process
+        if let Err(err) = tokio::task::spawn_blocking(move || {
+            // Kill the process
+            unsafe {
+                kill(self.pid, libc::SIGTERM);
+            }
+        })
+        .await
+        {
+            eprintln!("failed to join unoserver kill: {err}")
+        }
+    }
+}
+
+/// Start a unoserver instance
+pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<UnoServer, ServerError> {
     // Timeout if the server didn't start within 5 minutes
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
@@ -406,7 +442,6 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHan
         // Pipe output for reading
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .map_err(ServerError::ProcessIo)?;
 
@@ -423,18 +458,23 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<AbortHan
                 .ok_or(ServerError::NoStartupMessage)?;
 
             // Wait until startup message is received
-            if value.contains("Server PID:") {
-                break;
-            }
+            let index = match value.find("Server PID:") {
+                Some(value) => value,
+                None => continue,
+            };
+
+            let after_msg = &value[index..];
+            let (_left, right) = after_msg
+                .split_once(":")
+                .ok_or(ServerError::InvalidOrMissingPid)?;
+
+            let pid = right
+                .trim()
+                .parse::<libc::pid_t>()
+                .map_err(|_| ServerError::InvalidOrMissingPid)?;
+
+            return Ok(UnoServer { child, pid });
         }
-
-        // Move server to background task
-        let abort_handle = tokio::spawn(async move {
-            _ = child.wait().await;
-        })
-        .abort_handle();
-
-        Ok(abort_handle)
     })
     .await
     .map_err(|_| ServerError::StartTimeoutReached)
@@ -509,7 +549,7 @@ mod test {
         ConvertServerState, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
     };
     use std::{sync::Arc, time::Duration};
-    use tokio::task::JoinSet;
+    use tokio::{task::JoinSet, try_join};
 
     /// Tests the unoserver can be started
     #[tokio::test]
@@ -685,5 +725,38 @@ mod test {
         }
 
         while (join_set.join_next().await).is_some() {}
+    }
+
+    /// Tests a sample docx
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "slow and resource intensive if these tests are run all at once, requires running remote instance"]
+    async fn test_sample_docx_local_load_balanced() {
+        let (a, b) = try_join!(start_unoserver(9250, 9251), start_unoserver(9252, 9253)).unwrap();
+
+        let pool = ConvertLoadBalancer::new(
+            vec![
+                ConvertServer::new(ConvertServerHost::Local { port: 9250 }),
+                ConvertServer::new(ConvertServerHost::Local { port: 9252 }),
+            ],
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        );
+
+        let mut join_set = JoinSet::new();
+        let input_bytes = Arc::new(tokio::fs::read("./samples/sample-docx.docx").await.unwrap());
+
+        for _ in 0..10 {
+            let pool = pool.clone();
+            let input_bytes = input_bytes.clone();
+
+            join_set.spawn(async move {
+                pool.handle(&input_bytes).await.unwrap();
+            });
+        }
+
+        while (join_set.join_next().await).is_some() {}
+
+        a.stop().await;
+        b.stop().await;
     }
 }

@@ -16,3 +16,6 @@ thiserror = "1"
 
 # Asyncronous runtime
 tokio = { version = "1", features = ["full"] }
+
+# libc for killing libreoffice by PID
+libc = "0.2"

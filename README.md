@@ -7,6 +7,9 @@ convert the office files to PDF.
 
 Supports handling remote unoserver instances and load balancing traffic between multiple unoserver instances
 
+> [!IMPORTANT]
+> Only supported on Linux targets
+
 ## Installation
 
 Install LibreOffice, Python 3, and Python 3 pip (Command for Debian, apt package manager. Adjust for your distro):
@@ -15,12 +18,16 @@ Install LibreOffice, Python 3, and Python 3 pip (Command for Debian, apt package
 sudo apt-get install -y libreoffice python3 python3-pip
 ```
 
-
 Install unoserver pip module
 
 ```sh
 sudo pip install unoserver
 ```
+
+`unoserver` must be on your path if you want to start a server 
+`unoconvert` must be on your path if you want to convert files
+
+Both should be on your path by default after installing unoserver.
 
 ## Start server instance
 
