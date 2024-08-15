@@ -14,11 +14,5 @@ description = "Convert office files to pdf files"
 # Error handling
 thiserror = "1"
 
-# System info to check running processes
-sysinfo = "0.30"
-
 # Asyncronous runtime
 tokio = { version = "1", features = ["full"] }
-
-# Request for busy checking
-reqwest = "0.12"

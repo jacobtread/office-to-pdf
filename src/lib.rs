@@ -14,8 +14,8 @@
 //! Requires libreoffice and unoserver, only supported for linux. See README for installation
 //! details
 
-use reqwest::Client;
 use std::{
+    net::SocketAddr,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -23,10 +23,10 @@ use std::{
     },
     time::Duration,
 };
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{lookup_host, TcpStream},
     process::Command,
     sync::Notify,
     task::AbortHandle,
@@ -67,9 +67,6 @@ pub enum OfficeError {
     /// Converter program returned an error
     #[error("converter returned error: {0}")]
     ConverterError(String),
-
-    #[error("failed to create load balancer client: {0}")]
-    CreateLoadBalancer(reqwest::Error),
 }
 
 /// Default port for unoserver
@@ -101,9 +98,104 @@ pub struct ConvertServer {
     host: ConvertServerHost,
 }
 
+pub enum ConvertServerState {
+    /// Server cannot be reached
+    Unreachable,
+    /// Server is currently too busy to response
+    Busy,
+    /// Some IO failure is occurring
+    Failure,
+    /// Server is connectable and can process requests
+    Available,
+}
+
 impl ConvertServer {
+    pub const DEFAULT_RUNNING_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn new(host: ConvertServerHost) -> Self {
         Self { host }
+    }
+
+    /// Obtains a socket address to the server
+    pub async fn socket_addr(&self) -> std::io::Result<SocketAddr> {
+        // Determine the server host and port
+        let addr = match &self.host {
+            ConvertServerHost::Local { port } => ("127.0.0.1", *port),
+            ConvertServerHost::Remote { host, port } => (host.as_str(), *port),
+        };
+
+        // Resolve the address
+        let mut addrs = lookup_host(addr).await?;
+        addrs.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unable to resolve socket address",
+            )
+        })
+    }
+
+    /// Checks if the server is running
+    ///
+    /// The following states are considered running:
+    ///
+    /// [ConvertServerState::Busy] [ConvertServerState::Failure] [ConvertServerState::Available]
+    pub async fn is_running(&self, timeout_after: Duration) -> bool {
+        match self
+            .server_state(timeout_after, Duration::from_millis(100))
+            .await
+        {
+            ConvertServerState::Busy
+            | ConvertServerState::Available
+            | ConvertServerState::Failure => true,
+            ConvertServerState::Unreachable => false,
+        }
+    }
+
+    /// Checks the current server state by making a simple request to it.
+    ///
+    /// If the server cannot be connected to its considered [ConvertServerState::Unreachable]
+    ///
+    /// If the server failed an IO portion its considered [ConvertServerState::Failure]
+    ///
+    /// If the server didn't reply to the ping message within the busy timeout it is
+    /// considered [ConvertServerState::Busy]
+    ///
+    /// If the server is connectable and not busy it is considered [ConvertServerState::Available]
+    pub async fn server_state(
+        &self,
+        connect_timeout: Duration,
+        busy_timeout: Duration,
+    ) -> ConvertServerState {
+        let addr = match self.socket_addr().await {
+            Ok(value) => value,
+            // Failed to obtain server socket address
+            Err(_) => return ConvertServerState::Unreachable,
+        };
+
+        // Open a stream connection
+        let mut stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => stream,
+            // Got some other connection error
+            Ok(Err(_)) => return ConvertServerState::Unreachable,
+            // Hit a timeout
+            Err(_) => return ConvertServerState::Unreachable,
+        };
+
+        // Write the most basic of a request
+        if stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.is_err() {
+            return ConvertServerState::Failure;
+        }
+
+        // Just enough buffer to get the first part of the response HTTP/VERSION + STATUS
+        let mut buffer = [0; 15];
+
+        match timeout(busy_timeout, stream.read_exact(&mut buffer)).await {
+            Ok(Ok(_)) => ConvertServerState::Available,
+            // Got some other IO error
+            Ok(Err(_)) => ConvertServerState::Failure,
+            // Hit a timeout
+            Err(_) => ConvertServerState::Busy,
+        }
     }
 
     /// Converts the provided office file bytes to PDF file bytes
@@ -184,15 +276,6 @@ impl ConvertServer {
     }
 }
 
-/// Check the conversion server is running
-pub fn is_unoserver_running() -> bool {
-    let system =
-        System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::new()));
-    let mut processes = system.processes_by_name("unoserver");
-
-    processes.next().is_some()
-}
-
 /// Simple load balancer for distributing load amongst the provided servers.
 ///
 /// Checks if servers are too under load to process a request and attempts
@@ -205,10 +288,10 @@ pub struct ConvertLoadBalancer {
 /// Inner shared contents of [ConvertLoadBalancer]
 struct ConvertLoadBalancerInner {
     servers: Vec<LoadBalanced>,
-    /// Client for checking busy connections
-    client: reqwest::Client,
     /// Notifier for when connections are no longer busy
     free_notify: Notify,
+    connect_timeout: Duration,
+    busy_timeout: Duration,
 }
 
 /// Load balanced [ConvertServer] contains the busy state for
@@ -225,14 +308,13 @@ impl ConvertLoadBalancer {
     ///
     /// ## Arguments
     /// * `servers` - The servers to load balance
-    /// * `busy_timeout` - Timeout to wait before considering an instance to be busy
-    ///                    ensure you account for over the internet transfer when using
-    ///                    remote instances, this is only for a cheap ping HTTP request
-    pub fn new(servers: Vec<ConvertServer>, busy_timeout: Duration) -> Result<Self, OfficeError> {
-        let client = Client::builder()
-            .timeout(busy_timeout)
-            .build()
-            .map_err(OfficeError::CreateLoadBalancer)?;
+    /// * `connect_timeout` - Timeout to wait while attempting to connect to a server to check if the server is available
+    /// * `busy_timeout` - Timeout to wait until data is received when checking if a server is available
+    pub fn new(
+        servers: Vec<ConvertServer>,
+        connect_timeout: Duration,
+        busy_timeout: Duration,
+    ) -> Self {
         let free_notify = Notify::new();
         let servers = servers
             .into_iter()
@@ -241,13 +323,15 @@ impl ConvertLoadBalancer {
                 busy: AtomicBool::new(false),
             })
             .collect();
-        Ok(Self {
+
+        Self {
             inner: Arc::new(ConvertLoadBalancerInner {
                 servers,
-                client,
                 free_notify,
+                connect_timeout,
+                busy_timeout,
             }),
-        })
+        }
     }
 
     /// Handles a conversion using one of the load balancers
@@ -261,23 +345,22 @@ impl ConvertLoadBalancer {
                     continue;
                 }
 
-                // Determine the server host and port
-                let (host, port) = match &server.server.host {
-                    ConvertServerHost::Local { port } => ("localhost", port),
-                    ConvertServerHost::Remote { host, port } => (host.as_str(), port),
-                };
-
-                // Attempt to connect to the server to see if its busy or available
-                if inner
-                    .client
-                    .get(format!("http://{}:{}", host, port))
-                    .send()
+                // Determine the current server state
+                match server
+                    .server
+                    .server_state(self.inner.connect_timeout, self.inner.busy_timeout)
                     .await
-                    .is_err()
                 {
-                    // Mark server busy
-                    server.busy.store(true, Ordering::SeqCst);
-                    continue;
+                    // Server is unreachable or failing currently; move to the next one
+                    ConvertServerState::Unreachable | ConvertServerState::Failure => continue,
+                    // Server is currently busy
+                    ConvertServerState::Busy => {
+                        // Mark server busy
+                        server.busy.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                    // Server is available, we can use it
+                    ConvertServerState::Available => {}
                 }
 
                 // Give the load to the server
@@ -424,13 +507,13 @@ const CONVERTABLE_FORMATS: &[&str] = &[
 #[cfg(test)]
 mod test {
 
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use tokio::task::JoinSet;
 
     use crate::{
-        start_unoserver, ConvertLoadBalancer, ConvertServer, ConvertServerHost, OfficeError,
-        DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
+        start_unoserver, ConvertLoadBalancer, ConvertServer, ConvertServerHost, ConvertServerState,
+        OfficeError, DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
     };
 
     /// Tests the unoserver can be started
@@ -440,6 +523,29 @@ mod test {
         start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
             .await
             .unwrap();
+    }
+
+    /// Tests the unoserver can be started
+    #[tokio::test]
+    #[ignore = "requires unoserver started in advance to compare"]
+    async fn test_unoserver_is_running() {
+        let server = ConvertServer::new(ConvertServerHost::Local { port: 9250 });
+
+        let is_running = server.is_running(Duration::from_secs(5)).await;
+
+        assert!(is_running);
+    }
+
+    /// Tests the unoserver can be started
+    #[tokio::test]
+    #[ignore = "requires setting up an unoserver and making it busy while testing"]
+    async fn test_unoserver_is_busy() {
+        let server = ConvertServer::new(ConvertServerHost::Local { port: 9250 });
+
+        let result = server
+            .server_state(Duration::from_millis(100), Duration::from_millis(500))
+            .await;
+        assert!(matches!(result, ConvertServerState::Busy));
     }
 
     /// Tests a sample docx
@@ -544,33 +650,31 @@ mod test {
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once, requires running remote instance"]
     async fn test_sample_docx_remote_load_balanced() {
-        let pool = Arc::new(
-            ConvertLoadBalancer::new(
-                vec![
-                    ConvertServer::new(ConvertServerHost::Remote {
-                        host: "localhost".to_string(),
-                        port: 9250,
-                    }),
-                    ConvertServer::new(ConvertServerHost::Remote {
-                        host: "localhost".to_string(),
-                        port: 9251,
-                    }),
-                    ConvertServer::new(ConvertServerHost::Remote {
-                        host: "localhost".to_string(),
-                        port: 9252,
-                    }),
-                    ConvertServer::new(ConvertServerHost::Remote {
-                        host: "localhost".to_string(),
-                        port: 9253,
-                    }),
-                    ConvertServer::new(ConvertServerHost::Remote {
-                        host: "localhost".to_string(),
-                        port: 9254,
-                    }),
-                ],
-                Duration::from_millis(500),
-            )
-            .unwrap(),
+        let pool = ConvertLoadBalancer::new(
+            vec![
+                ConvertServer::new(ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9250,
+                }),
+                ConvertServer::new(ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9251,
+                }),
+                ConvertServer::new(ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9252,
+                }),
+                ConvertServer::new(ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9253,
+                }),
+                ConvertServer::new(ConvertServerHost::Remote {
+                    host: "localhost".to_string(),
+                    port: 9254,
+                }),
+            ],
+            Duration::from_millis(200),
+            Duration::from_millis(500),
         );
 
         let mut join_set = JoinSet::new();
