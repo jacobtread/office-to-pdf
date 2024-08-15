@@ -4,7 +4,7 @@
 use libc::kill;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -20,6 +20,7 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
+use tracing::{debug, warn};
 
 /// Errors that can occur while converting an office file
 #[derive(Debug, Error)]
@@ -359,7 +360,7 @@ impl ConvertLoadBalancer {
         let inner = &*self.inner;
 
         loop {
-            for server in &inner.servers {
+            for (index, server) in inner.servers.iter().enumerate() {
                 // Skip busy servers
                 if server.busy.load(Ordering::Acquire) {
                     continue;
@@ -372,11 +373,15 @@ impl ConvertLoadBalancer {
                     .await
                 {
                     // Server is unreachable or failing currently; move to the next one
-                    ConvertServerState::Unreachable | ConvertServerState::Failure => continue,
+                    ConvertServerState::Unreachable | ConvertServerState::Failure => {
+                        warn!("failed to reach converter server {index}");
+                        continue;
+                    }
                     // Server is currently busy
                     ConvertServerState::Busy => {
                         // Mark server busy
                         server.busy.store(true, Ordering::SeqCst);
+                        debug!("server {index} reached busy timeout, marking as a busy server");
                         continue;
                     }
                     // Server is available, we can use it
@@ -385,6 +390,8 @@ impl ConvertLoadBalancer {
 
                 // Give the load to the server
                 let result = server.server.convert_to_pdf(input_bytes).await;
+
+                debug!("server {index} completed work, marking not busy");
 
                 server.busy.store(false, Ordering::SeqCst);
 
@@ -414,6 +421,11 @@ pub struct LocalServer {
 }
 
 impl LocalServer {
+    /// Wait for the child process to complete
+    pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
     /// Stops the server
     pub async fn stop(mut self) -> std::io::Result<()> {
         // Kill the child process
@@ -537,6 +549,8 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<LocalSer
                 .await
                 .map_err(ServerError::ProcessIo)?
                 .ok_or(ServerError::NoStartupMessage)?;
+
+            debug!(%value, "unoserver message");
 
             // Wait until startup message is received
             let index = match value.find("Server PID:") {
