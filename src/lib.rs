@@ -20,7 +20,7 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Errors that can occur while converting an office file
 #[derive(Debug, Error)]
@@ -401,6 +401,8 @@ impl ConvertLoadBalancer {
                 return result;
             }
 
+            debug!("all servers are busy, waiting for free server");
+
             // Wait until a server is free before continuing
             inner.free_notify.notified().await;
         }
@@ -481,7 +483,6 @@ impl LocalServerPool {
 
             join_set.spawn(async move {
                 let server = start_unoserver(server_port, uno_port).await?;
-
                 Ok(server)
             });
         }
@@ -489,11 +490,13 @@ impl LocalServerPool {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(value)) => pool.servers.push(value),
-                Ok(Err(err)) => {
+                Ok(Err(cause)) => {
+                    error!(%cause, "failed to allocate complete local server pool, stopping servers");
                     pool.stop().await;
-                    return Err(err);
+                    return Err(cause);
                 }
-                Err(_) => {
+                Err(cause) => {
+                    error!(%cause, "failed to allocate complete local server pool, stopping servers");
                     pool.stop().await;
                     return Err(ServerError::AllocatePool);
                 }
@@ -567,6 +570,8 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<LocalSer
                 .trim()
                 .parse::<libc::pid_t>()
                 .map_err(|_| ServerError::InvalidOrMissingPid)?;
+
+            debug!(%server_port, %pid, "started local server {index}");
 
             return Ok(LocalServer {
                 host: ConvertServerHost::Local { port: server_port },
