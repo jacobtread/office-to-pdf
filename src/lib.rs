@@ -72,14 +72,26 @@ pub enum OfficeError {
     CreateLoadBalancer(reqwest::Error),
 }
 
-#[derive(Debug, Default)]
+/// Default port for unoserver
+pub const DEFAULT_SERVER_PORT: u16 = 2003;
+/// Default port for the Libreoffice uno
+pub const DEFAULT_UNO_PORT: u16 = 2002;
+
+#[derive(Debug)]
 pub enum ConvertServerHost {
     /// Local converter server
-    #[default]
-    Local,
+    Local { port: u16 },
 
     /// Remove converter server
     Remote { host: String, port: u16 },
+}
+
+impl Default for ConvertServerHost {
+    fn default() -> Self {
+        Self::Local {
+            port: DEFAULT_SERVER_PORT,
+        }
+    }
 }
 
 /// Convert server
@@ -99,9 +111,12 @@ impl ConvertServer {
         let mut args = Vec::<String>::new();
 
         match &self.host {
-            ConvertServerHost::Local => {
+            ConvertServerHost::Local { port } => {
                 args.push("--host-location".to_string());
                 args.push("local".to_string());
+
+                args.push("--port".to_string());
+                args.push(port.to_string());
             }
             ConvertServerHost::Remote { host, port } => {
                 args.push("--host-location".to_string());
@@ -248,8 +263,8 @@ impl ConvertLoadBalancer {
 
                 // Determine the server host and port
                 let (host, port) = match &server.server.host {
-                    ConvertServerHost::Local => ("localhost", 2003u16),
-                    ConvertServerHost::Remote { host, port } => (host.as_str(), *port),
+                    ConvertServerHost::Local { port } => ("localhost", port),
+                    ConvertServerHost::Remote { host, port } => (host.as_str(), port),
                 };
 
                 // Attempt to connect to the server to see if its busy or available
@@ -281,8 +296,6 @@ impl ConvertLoadBalancer {
         }
     }
 }
-
-pub const DEFAULT_PORT: u16 = 2003;
 
 /// Start the conversion server
 ///
@@ -417,20 +430,25 @@ mod test {
 
     use crate::{
         start_unoserver, ConvertLoadBalancer, ConvertServer, ConvertServerHost, OfficeError,
+        DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT,
     };
 
     /// Tests the unoserver can be started
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_unoserver() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
     }
 
     /// Tests a sample docx
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_sample_docx() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-docx.docx").await.unwrap();
         let _output = ConvertServer::default()
@@ -443,7 +461,9 @@ mod test {
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_sample_docx_with_image() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-docx-with-image.docx")
             .await
@@ -458,7 +478,9 @@ mod test {
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_sample_docx_encrypted() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-docx-encrypted.docx")
             .await
@@ -475,7 +497,9 @@ mod test {
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_sample_xlsx() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-xlsx.xlsx").await.unwrap();
         let _output = ConvertServer::default()
@@ -487,7 +511,9 @@ mod test {
     #[tokio::test]
     #[ignore = "slow and resource intensive if these tests are run all at once"]
     async fn test_sample_xlsx_encrypted() {
-        start_unoserver(2003, 2004).await.unwrap();
+        start_unoserver(DEFAULT_SERVER_PORT, DEFAULT_UNO_PORT)
+            .await
+            .unwrap();
 
         let input_bytes = tokio::fs::read("./samples/sample-xlsx-encrypted.xlsx")
             .await
