@@ -1,6 +1,6 @@
 [package]
 name = "office-to-pdf"
-version = "0.1.0"
+version = "0.2.0"
 readme = "README.md"
 keywords = ["EA", "PocketRelay", "MassEffect"]
 edition = "2021"
