@@ -614,6 +614,8 @@ pub const CONVERTABLE_FORMATS: &[&str] = &[
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.slideshow",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.presentation",
     "application/x-fictionbook+xml",
     "application/x-aportisdoc",
     "application/prs.plucker",
