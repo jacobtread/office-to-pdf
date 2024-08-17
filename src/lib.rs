@@ -161,15 +161,14 @@ impl ConvertServer {
     ///
     /// [ConvertServerState::Busy] [ConvertServerState::Failure] [ConvertServerState::Available]
     pub async fn is_running(&self, timeout_after: Duration) -> bool {
-        match self
+        let state = self
             .server_state(timeout_after, Duration::from_millis(100))
-            .await
-        {
-            ConvertServerState::Busy
-            | ConvertServerState::Available
-            | ConvertServerState::Failure => true,
-            ConvertServerState::Unreachable => false,
-        }
+            .await;
+
+        matches!(
+            state,
+            ConvertServerState::Busy | ConvertServerState::Available | ConvertServerState::Failure
+        )
     }
 
     /// Checks the current server state by making a simple request to it.
