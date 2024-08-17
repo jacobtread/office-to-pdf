@@ -523,8 +523,7 @@ impl LocalServerPool {
 
 /// Start a unoserver instance
 pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<LocalServer, ServerError> {
-    // Timeout if the server didn't start within 5 minutes
-    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+    debug!(%server_port, %uno_port, "starting local server");
 
     // Spawn the unoserver process
     let mut child = Command::new("unoserver")
@@ -540,48 +539,58 @@ pub async fn start_unoserver(server_port: u16, uno_port: u16) -> Result<LocalSer
         .spawn()
         .map_err(ServerError::ProcessIo)?;
 
-    timeout(STARTUP_TIMEOUT, async move {
-        let stderr = child.stderr.as_mut().expect("child missing stdout");
-        let mut stderr_reader = BufReader::new(stderr).lines();
+    // Timeout if we don't get a startup message within 5 minutes
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60 * 5);
 
-        loop {
-            // Read from the input
-            let value = stderr_reader
-                .next_line()
-                .await
-                .map_err(ServerError::ProcessIo)?
-                .ok_or(ServerError::NoStartupMessage)?;
+    // Obtain PID from startup message
+    let pid = timeout(STARTUP_TIMEOUT, read_server_startup_pid(&mut child))
+        .await
+        .map_err(|_| ServerError::StartTimeoutReached)
+        .and_then(std::convert::identity)?;
 
-            debug!(%value, "unoserver message");
+    debug!(%server_port, %pid, "started local server");
 
-            // Wait until startup message is received
-            let index = match value.find("Server PID:") {
-                Some(value) => value,
-                None => continue,
-            };
-
-            let after_msg = &value[index..];
-            let (_left, right) = after_msg
-                .split_once(":")
-                .ok_or(ServerError::InvalidOrMissingPid)?;
-
-            let pid = right
-                .trim()
-                .parse::<libc::pid_t>()
-                .map_err(|_| ServerError::InvalidOrMissingPid)?;
-
-            debug!(%server_port, %pid, "started local server {index}");
-
-            return Ok(LocalServer {
-                host: ConvertServerHost::Local { port: server_port },
-                child,
-                pid,
-            });
-        }
+    Ok(LocalServer {
+        host: ConvertServerHost::Local { port: server_port },
+        child,
+        pid,
     })
-    .await
-    .map_err(|_| ServerError::StartTimeoutReached)
-    .and_then(std::convert::identity)
+}
+
+/// Reads the server startup message and PID for libreoffice from the provided
+/// child process stderr
+async fn read_server_startup_pid(child: &mut Child) -> Result<libc::pid_t, ServerError> {
+    let stderr = child.stderr.as_mut().expect("child missing stdout");
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    loop {
+        // Read from the input
+        let value = stderr_reader
+            .next_line()
+            .await
+            .map_err(ServerError::ProcessIo)?
+            .ok_or(ServerError::NoStartupMessage)?;
+
+        debug!(%value, "unoserver message");
+
+        // Wait until startup message is received
+        let index = match value.find("Server PID:") {
+            Some(value) => value,
+            None => continue,
+        };
+
+        let after_msg = &value[index..];
+        let (_left, right) = after_msg
+            .split_once(":")
+            .ok_or(ServerError::InvalidOrMissingPid)?;
+
+        let pid = right
+            .trim()
+            .parse::<libc::pid_t>()
+            .map_err(|_| ServerError::InvalidOrMissingPid)?;
+
+        return Ok(pid);
+    }
 }
 
 /// Checks if the provided mime is included in the known convertable mime types
